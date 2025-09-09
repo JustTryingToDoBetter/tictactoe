@@ -27,5 +27,5 @@ def receive_message(sock, buffer):
                 return None, buffer
             return json.loads(line), buffer
     
-    except server.timeout:
+    except client.timeout:
         return None, buffer
