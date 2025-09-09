@@ -1,5 +1,6 @@
 import socket
 import json
+import threading
 def send_message(sock, obj):
     line = json.dumps(obj, separators=(",", ":")) + "\n"
     sock.sendall(line.encode('utf-8'))
@@ -18,39 +19,38 @@ def receive_message(sock, buffer):
     except socket.timeout:
         return None, buffer
 
+
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('127.0.0.1', 12345))
-server.listen(1)
+server.listen()
 print('server is listening')
 
-conn, addr = server.accept()
-print(f'connected by {addr}')
+def handle_client(conn, addr):
+    print(f'connected by {addr}')
+    buffer = ""
+    while True:
+        msg, buffer = receive_message(conn, buffer)
+        if msg is None:
+            break
+        msg_type = msg.get("type")
+        if msg_type == "MOVE":
+            print(f"Received MOVE: {msg}")
+            send_message(conn, {"type": "GAME_STATE", "board": ["X", "O", "", "", "", "", "", "", ""], "current_player": 2})
+        elif msg_type == "PLAYER_JOINED":
+            print(f"Player joined: {msg}")
+            send_message(conn, {"type": "GAME_STATE", "board": ["", "", "", "", "", "", "", "", ""], "current_player": 1})
+        elif msg_type == "GAME_OVER":
+            print(f"Game over: {msg}")
+            break
+        else:
+            print(f"Unknown message type: {msg}")
+    conn.close()
 
-buffer = ""
 while True:
-    msg, buffer = receive_message(conn, buffer)
-    if msg is None:
-        break
-    msg_type = msg.get("type")
-    if msg_type == "MOVE":
-        print(f"Received MOVE: {msg}")
-        # Respond with updated game state
-        send_message(conn, {"type": "GAME_STATE", "board": ["X", "O", "", 
-                                                            "", "", "", 
-                                                            "", "", ""], "current_player": 2})
-    elif msg_type == "PLAYER_JOINED":
-        print(f"Player joined: {msg}")
-        send_message(conn, {"type": "GAME_STATE", "board": ["", "", "", 
-                                                            "", "", "", 
-                                                            "", "", ""], "current_player": 1})
-    elif msg_type == "GAME_OVER":
-        print(f"Game over: {msg}")
-        break
-    else:
-        print(f"Unknown message type: {msg}")
+    conn, addr = server.accept()
+    thread = threading.Thread(target=handle_client, args=(conn, addr))
+    thread.start()
 
-conn.close()
-server.close()
-server.close() ## kill server
+
 
 
