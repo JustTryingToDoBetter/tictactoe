@@ -1,9 +1,15 @@
 # server.py
-import socket, threading
+import socket, threading, time, uuid
+from collections import defaultdict, OrderedDict
 from wire import send_obj, recv_obj, envelope
 
+# Policies (locked)
 HOST, PORT = "127.0.0.1", 12345
 GAME_ID = "G-1"
+HEARTBEAT_INTERVAL = 10
+GRACE_PERIOD = 60
+DEDUPE_WINDOW_MINUTES = 5
+
 
 class GameState:
     def __init__(self):
@@ -25,6 +31,7 @@ class GameState:
             "next_player_id": self.next_player_id if self.status == "IN_PROGRESS" else None,
             "turn": self.turn,
             "status": self.status,
+            "version": getattr(self, "version", 0),
         }
 
     def try_join(self, player_id, nickname=None, symbol=None, seat=None):
@@ -89,8 +96,14 @@ class GameState:
 class Server:
     def __init__(self):
         self.gs = GameState()
+        self.gs.version = 0
         self.lock = threading.Lock()  # protect gs
         self.peers = {}  # player_id -> conn
+        self.last_seen = {}  # player_id -> last heartbeat timestamp
+        # dedupe: player_id -> OrderedDict(msg_id -> (timestamp, result_env))
+        self.dedupe = defaultdict(OrderedDict)
+        # start monitor thread
+        threading.Thread(target=self._monitor_heartbeats, daemon=True).start()
 
     def start(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -110,6 +123,10 @@ class Server:
                 if msg is None:
                     break
                 mtype, payload = msg.get("type"), msg.get("payload", {})
+                # HEARTBEAT handling
+                if mtype == "PING":
+                    send_obj(conn, envelope("PONG", GAME_ID, {}))
+                    continue
                 if mtype == "PLAYER_JOINED":
                     pid = payload["player_id"]
                     with self.lock:
@@ -120,6 +137,7 @@ class Server:
                         self.gs.players[pid]["conn"] = conn
                         self.peers[pid] = conn
                         player_id = pid
+                        self.last_seen[pid] = time.time()
                         # Send current state to the joiner
                         self._send_state(to_conn=conn)
                         # If game started (second player), broadcast to all
@@ -128,12 +146,32 @@ class Server:
                 elif mtype == "MOVE":
                     pid, x, y = payload["player_id"], int(payload["x"]), int(payload["y"])
                     client_turn = payload.get("turn")
+                    msg_id = payload.get("msg_id")
+                    # dedupe check
+                    if msg_id:
+                        cache = self.dedupe[pid]
+                        if msg_id in cache:
+                            # replay stored outcome
+                            send_obj(conn, cache[msg_id][1])
+                            continue
+                    self.last_seen[pid] = time.time()
                     with self.lock:
                         ok, err = self.gs.validate_move(pid, x, y, client_turn)
                         if not ok:
-                            self._send_error(self.peers.get(pid, conn), err)
+                            env = envelope("ERROR", GAME_ID, {"code": err[0], "message": err[1]})
+                            send_obj(self.peers.get(pid, conn), env)
+                            # store error in dedupe cache
+                            if msg_id:
+                                self._cache_dedupe(pid, msg_id, env)
                             continue
                         outcome = self.gs.apply_move(pid, x, y)
+                        # bump version
+                        self.gs.version = getattr(self.gs, "version", 0) + 1
+                        # send confirmation to actor
+                        ack_env = envelope("MOVE_OK", GAME_ID, {"version": self.gs.version, "board": self.gs.serialize()["board"]})
+                        send_obj(self.peers.get(pid, conn), ack_env)
+                        if msg_id:
+                            self._cache_dedupe(pid, msg_id, ack_env)
                         if self.gs.status == "GAME_OVER":
                             self._broadcast_game_over(outcome)
                         else:
@@ -174,6 +212,33 @@ class Server:
         for c in conns:
             try: send_obj(c, env)
             except: pass
+
+    def _cache_dedupe(self, pid, msg_id, env):
+        cache = self.dedupe[pid]
+        cache[msg_id] = (time.time(), env)
+        # purge old
+        cutoff = time.time() - (DEDUPE_WINDOW_MINUTES * 60)
+        keys = list(cache.keys())
+        for k in keys:
+            if cache[k][0] < cutoff:
+                del cache[k]
+
+    def _monitor_heartbeats(self):
+        while True:
+            now = time.time()
+            to_forfeit = []
+            for pid, last in list(self.last_seen.items()):
+                if now - last > GRACE_PERIOD:
+                    to_forfeit.append(pid)
+            for pid in to_forfeit:
+                print(f"Player {pid} exceeded grace period; marking disconnected")
+                # remove peer and mark disconnected
+                conn = self.peers.pop(pid, None)
+                self.last_seen.pop(pid, None)
+                try:
+                    if conn: conn.close()
+                except: pass
+            time.sleep(HEARTBEAT_INTERVAL)
 
 if __name__ == "__main__":
     Server().start()
