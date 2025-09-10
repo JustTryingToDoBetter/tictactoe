@@ -1,9 +1,10 @@
 # client.py
-import socket, threading, json
+import socket, threading, json, time, uuid
 from wire import send_obj, recv_obj, envelope
 
 HOST, PORT = "127.0.0.1", 12345
 GAME_ID = "G-1"
+HEARTBEAT_INTERVAL = 10
 
 class Client:
     def __init__(self, player_id, nickname=""):
@@ -11,6 +12,7 @@ class Client:
         self.nickname = nickname
         self.state = None  # last GAME_STATE
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._running = True
 
     def start(self):
         self.sock.connect((HOST, PORT))
@@ -19,23 +21,34 @@ class Client:
         send_obj(self.sock, join)
         # Listen thread
         threading.Thread(target=self._listen, daemon=True).start()
+        # Heartbeat thread
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         # Input loop
-        while True:
+        while self._running:
             if self.state and self.state["status"] == "IN_PROGRESS" and self.state.get("next_player_id") == self.player_id:
                 try:
                     raw = input("Your turn (x y): ").strip()
                     x, y = map(int, raw.split())
+                    msg_id = str(uuid.uuid4())
                     move = envelope("MOVE", GAME_ID, {
                         "player_id": self.player_id,
                         "x": x, "y": y,
-                        "turn": self.state["turn"]
+                        "turn": self.state["turn"],
+                        "msg_id": msg_id
                     })
                     send_obj(self.sock, move)
-                except Exception as e:
+                except Exception:
                     print("Invalid input. Use: 0 2")
             else:
-                # Small idle to reduce busy-wait, or press Enter to refresh
+                time.sleep(0.1)
+
+    def _heartbeat_loop(self):
+        while self._running:
+            try:
+                send_obj(self.sock, envelope("PING", GAME_ID, {}))
+            except Exception:
                 pass
+            time.sleep(HEARTBEAT_INTERVAL)
 
     def _listen(self):
         while True:
@@ -53,6 +66,11 @@ class Client:
                 print(f"GAME OVER: {p['result']}, line={p['winning_line']}")
             elif t == "ERROR":
                 print(f"ERROR {p['code']}: {p['message']}")
+            elif t == "PONG":
+                # heartbeat reply
+                pass
+            elif t == "MOVE_OK":
+                print(f"Move acknowledged (version={p.get('version')})")
             else:
                 print("Unknown message:", t)
 
