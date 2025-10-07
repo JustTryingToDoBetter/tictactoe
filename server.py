@@ -13,9 +13,9 @@ DEDUPE_WINDOW_MINUTES = 5
 
 class GameState:
     def __init__(self):
-        self.board = [[None]*3 for _ in range(3)]
+        self.board = [[None] * 3 for _ in range(3)]
         self.players = {}  # player_id -> {"symbol": "X"/"O", "seat": 0/1, "conn": socket}
-        self.order = []    # [player_id_X, player_id_O]
+        self.order = []  # [player_id_X, player_id_O]
         self.turn = 0
         self.next_player_id = None
         self.status = "WAITING"  # WAITING | IN_PROGRESS | GAME_OVER
@@ -84,22 +84,32 @@ class GameState:
     def _winner_line(self, sym):
         b = self.board
         lines = [
-            [(0,0),(1,0),(2,0)], [(0,1),(1,1),(2,1)], [(0,2),(1,2),(2,2)], # rows
-            [(0,0),(0,1),(0,2)], [(1,0),(1,1),(1,2)], [(2,0),(2,1),(2,2)], # cols
-            [(0,0),(1,1),(2,2)], [(2,0),(1,1),(0,2)]                      # diags
+            [(0, 0), (1, 0), (2, 0)],
+            [(0, 1), (1, 1), (2, 1)],
+            [(0, 2), (1, 2), (2, 2)],  # rows
+            [(0, 0), (0, 1), (0, 2)],
+            [(1, 0), (1, 1), (1, 2)],
+            [(2, 0), (2, 1), (2, 2)],  # cols
+            [(0, 0), (1, 1), (2, 2)],
+            [(2, 0), (1, 1), (0, 2)],  # diags
         ]
         for line in lines:
-            if all(b[y][x] == sym for (x,y) in line):
+            if all(b[y][x] == sym for (x, y) in line):
                 return line
         return None
+
 
 class Server:
     def __init__(self):
         self.gs = GameState()
         self.gs.version = 0
         self.lock = threading.Lock()  # protect gs
-        self.peers = {}  # player_id -> conn
-        self.last_seen = {}  # player_id -> last heartbeat timestamp
+        # player_id -> connection socket
+        self.peers = {}
+        # connection socket -> player_id for quick lookup
+        self.conn_to_pid = {}
+        # player_id -> last heartbeat timestamp
+        self.last_seen = {}
         # dedupe: player_id -> OrderedDict(msg_id -> (timestamp, result_env))
         self.dedupe = defaultdict(OrderedDict)
         # start monitor thread
@@ -125,6 +135,10 @@ class Server:
                 mtype, payload = msg.get("type"), msg.get("payload", {})
                 # HEARTBEAT handling
                 if mtype == "PING":
+                    # On heartbeat, update last_seen for this player if known
+                    pid = self.conn_to_pid.get(conn)
+                    if pid:
+                        self.last_seen[pid] = time.time()
                     send_obj(conn, envelope("PONG", GAME_ID, {}))
                     continue
                 if mtype == "PLAYER_JOINED":
@@ -136,6 +150,8 @@ class Server:
                             continue
                         self.gs.players[pid]["conn"] = conn
                         self.peers[pid] = conn
+                        # also map connection back to pid for heartbeat updates
+                        self.conn_to_pid[conn] = pid
                         player_id = pid
                         self.last_seen[pid] = time.time()
                         # Send current state to the joiner
@@ -143,6 +159,30 @@ class Server:
                         # If game started (second player), broadcast to all
                         if self.gs.status == "IN_PROGRESS":
                             self._broadcast_state()
+                elif mtype == "RESUME":
+                    # Client is requesting to resume a previous session.
+                    pid = payload.get("player_id")
+                    known_version = payload.get("known_version")
+                    if pid not in self.gs.players:
+                        # Unknown player
+                        self._send_error(conn, ("UNKNOWN_PLAYER", f"No such player {pid}"))
+                        continue
+                    with self.lock:
+                        # Attach the new connection to this player
+                        self.peers[pid] = conn
+                        self.conn_to_pid[conn] = pid
+                        self.gs.players[pid]["conn"] = conn
+                        self.last_seen[pid] = time.time()
+                        # If client believes it has a certain version, we ensure they are not ahead
+                        if known_version is not None and known_version > self.gs.version:
+                            self._send_error(conn, ("VERSION_AHEAD", "Client version ahead of server"))
+                            continue
+                        # Send current authoritative state
+                        self._send_state(to_conn=conn)
+                        # If both players connected, broadcast full state to others
+                        if self.gs.status == "IN_PROGRESS":
+                            self._broadcast_state()
+                    continue
                 elif mtype == "MOVE":
                     pid, x, y = payload["player_id"], int(payload["x"]), int(payload["y"])
                     client_turn = payload.get("turn")
@@ -179,6 +219,15 @@ class Server:
                 else:
                     self._send_error(conn, ("BAD_TYPE", f"Unsupported type {mtype}"))
         finally:
+            # Clean up reverse mapping on disconnect
+            try:
+                pid = self.conn_to_pid.pop(conn, None)
+                if pid:
+                    # Do not remove gs.player; just mark connection as gone
+                    self.peers.pop(pid, None)
+                    self.gs.players[pid]["conn"] = None
+            except Exception:
+                pass
             conn.close()
 
     # --- send helpers ---
@@ -196,7 +245,7 @@ class Server:
         payload = {
             "result": outcome["result"],
             "winning_line": outcome["winning_line"],
-            "final_state": self.gs.serialize()
+            "final_state": self.gs.serialize(),
         }
         env = envelope("GAME_OVER", GAME_ID, payload)
         self._broadcast(env)
@@ -210,8 +259,10 @@ class Server:
         # Snapshot peers to avoid holding lock while sending
         conns = list(self.peers.values())
         for c in conns:
-            try: send_obj(c, env)
-            except: pass
+            try:
+                send_obj(c, env)
+            except Exception:
+                pass
 
     def _cache_dedupe(self, pid, msg_id, env):
         cache = self.dedupe[pid]
@@ -236,9 +287,12 @@ class Server:
                 conn = self.peers.pop(pid, None)
                 self.last_seen.pop(pid, None)
                 try:
-                    if conn: conn.close()
-                except: pass
+                    if conn:
+                        conn.close()
+                except Exception:
+                    pass
             time.sleep(HEARTBEAT_INTERVAL)
+
 
 if __name__ == "__main__":
     Server().start()

@@ -2,8 +2,11 @@ import json, struct, time, uuid
 
 PROTOCOL_VERSION = '1.0'
 
-def now_ms(): return int(time.time() * 1000)
-def new_id(): return str(uuid.uuid4())
+def now_ms():
+    return int(time.time() * 1000)
+
+def new_id():
+    return str(uuid.uuid4())
 
 def send_obj(sock, obj: dict):
     data = json.dumps(obj).encode('utf-8')
@@ -13,12 +16,13 @@ def send_obj(sock, obj: dict):
 def recv_obj(sock):
     # Read 4 bytes length
     hdr = _recvall(sock, 4)
-    if not hdr: return None
+    if not hdr:
+        return None
     (length,) = struct.unpack("!I", hdr)
     payload = _recvall(sock, length)
-    if not payload: return None
+    if not payload:
+        return None
     return json.loads(payload.decode("utf-8"))
-
 
 def _recvall(sock, n):
     buf = b""
@@ -28,7 +32,6 @@ def _recvall(sock, n):
             return None
         buf += chunk
     return buf
-
 
 def envelope(msg_type, game_id, payload, msg_id=None):
     return {
